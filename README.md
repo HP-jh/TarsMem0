@@ -28,6 +28,14 @@ MCP integration for Mem0 (AI memory platform).
 - `mem0_search` — Search memories by query
 - `mem0_add` — Add a new memory entry
 
+## Build
+
+```bash
+make build
+# or
+docker build -t tarsmem0 .
+```
+
 ## Quick Start
 
 ```bash

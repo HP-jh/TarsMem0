@@ -11,32 +11,86 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 )
 
-var Version = "1.0.0"
+var Version = "1.10.0"
 const RepoName = "TarsMem0"
+
+var (
+	requestCount int64
+	errorCount   int64
+)
 
 type Client struct {
 	Endpoint string
 	APIKey   string
 	Client   *http.Client
+	MaxRetry int
+}
+
+func parseTimeout(envKey string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(envKey); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return fallback
+}
+
+func parseRetry() int {
+	if v := os.Getenv("TARS_MCP_MAX_RETRY"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 3
 }
 
 func NewClient(endpoint, apiKey string) *Client {
 	if endpoint == "" {
 		endpoint = "https://api.example.com"
 	}
+	timeout := parseTimeout("TARS_MCP_TIMEOUT", 30*time.Second)
 	return &Client{
 		Endpoint: strings.TrimRight(endpoint, "/"),
 		APIKey:   apiKey,
-		Client:   &http.Client{Timeout: 30 * time.Second},
+		Client:   &http.Client{Timeout: timeout},
+		MaxRetry: parseRetry(),
 	}
 }
 
 func (c *Client) req(ctx context.Context, method, path string, body interface{}) (map[string]interface{}, error) {
+	var lastErr error
+	for attempt := 0; attempt <= c.MaxRetry; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(1<<uint(attempt-1)) * 500 * time.Millisecond
+			if backoff > 10*time.Second {
+				backoff = 10 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		result, err := c.doReq(ctx, method, path, body)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return nil, lastErr
+}
+
+func (c *Client) doReq(ctx context.Context, method, path string, body interface{}) (map[string]interface{}, error) {
 	var bodyR io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -47,6 +101,7 @@ func (c *Client) req(ctx context.Context, method, path string, body interface{})
 	if c.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	}
+	req.Header.Set("User-Agent", RepoName+"/"+Version)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -71,6 +126,17 @@ func loadConfig() map[string]string {
 	}
 }
 
+func validateConfig(cfg map[string]string) error {
+	endpoint := cfg["endpoint"]
+	if endpoint == "" {
+		return fmt.Errorf("TARS_MCP_ENDPOINT 还没设置")
+	}
+	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+		return fmt.Errorf("TARS_MCP_ENDPOINT 必须以 http:// 或 https:// 开头")
+	}
+	return nil
+}
+
 func main() {
 	version := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -78,13 +144,19 @@ func main() {
 		fmt.Printf("%s v%s\n", RepoName, Version)
 		return
 	}
+
 	cfg := loadConfig()
+	if err := validateConfig(cfg); err != nil {
+		log.Fatalf("[FATAL] 配置检查没通过: %v", err)
+	}
 	client := NewClient(cfg["endpoint"], cfg["api_key"])
 	log.Printf("[%s] starting v%s endpoint=%s", RepoName, Version, cfg["endpoint"])
 	mode := os.Getenv("TARS_MCP_MODE")
 	if mode == "" { mode = "stdio" }
 	srv := &http.Server{Addr: ":8080", ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { withClient(client, healthHandler)(w, r) })
+	http.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) { versionHandler(w, r) })
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) { metricsHandler(w, r) })
 	http.HandleFunc("/tools", func(w http.ResponseWriter, r *http.Request) { withClient(client, toolsHandler)(w, r) })
 	http.HandleFunc("/invoke", func(w http.ResponseWriter, r *http.Request) { withClient(client, invokeHandler)(w, r) })
 	go func() {
@@ -92,7 +164,9 @@ func main() {
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		log.Printf("[%s] shutting down", RepoName)
-		_ = srv.Close()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
 	}()
 	if mode == "stdio" {
 		runStdioServer(client)
@@ -113,7 +187,9 @@ func withClient(client *Client, fn func(http.ResponseWriter, *http.Request, *Cli
 		if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
+		start := time.Now()
 		fn(w, r, client)
+		log.Printf("[%s] %s %s %s %s", RepoName, r.Method, r.URL.Path, time.Since(start).String(), r.UserAgent())
 	}
 }
 
@@ -125,6 +201,27 @@ func healthHandler(w http.ResponseWriter, r *http.Request, client *Client) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status": "ok", "version": Version, "name": RepoName, "upstream": up,
 		"time": time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func versionHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"name": RepoName, "version": Version, "go": runtime.Version(),
+	})
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"requests": requestCount, "errors": errorCount,
+		"memory": map[string]interface{}{
+			"alloc":        m.Alloc,
+			"sys":          m.Sys,
+			"goroutines":   runtime.NumGoroutine(),
+		},
 	})
 }
 
@@ -149,6 +246,24 @@ func toolsHandler(w http.ResponseWriter, r *http.Request, client *Client) {
 				"required":   []interface{}{"messages", "user_id"},
 			},
 		},
+		{
+			"name":        "mem0_get",
+			"description": "Get a memory by ID",
+			"inputSchema": map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"memory_id": map[string]interface{}{"type": "string", "description": "Memory ID"}},
+				"required":   []interface{}{"memory_id"},
+			},
+		},
+		{
+			"name":        "mem0_delete",
+			"description": "Delete a memory by ID",
+			"inputSchema": map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"memory_id": map[string]interface{}{"type": "string", "description": "Memory ID"}},
+				"required":   []interface{}{"memory_id"},
+			},
+		},
 		},
 	})
 }
@@ -156,41 +271,59 @@ func toolsHandler(w http.ResponseWriter, r *http.Request, client *Client) {
 func invokeHandler(w http.ResponseWriter, r *http.Request, client *Client) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "只接受 POST 请求"})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "这边只支持 POST 请求哦"})
 		return
 	}
 	var req struct { Tool string `json:"tool"`; Params map[string]interface{} `json:"params"` }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("解析失败：%v", err)})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("没看懂请求内容：%v", err)})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 	switch req.Tool {
 	case "mem0_search":
-		if req.Params["query"] == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "缺少参数：query"}); return }
-		result, err := client.req(ctx, "GET", "/v1/memories/?search={query}", nil)
+		if req.Params["query"] == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "需要参数：query"}); return }
+		result, err := client.req(ctx, "GET", "/v1/memories/?search="+fmt.Sprintf("%v", req.Params["query"]), nil)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("调用失败：%v", err)})
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("请求没成功：%v", err)})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": result})
 	case "mem0_add":
-		if req.Params["messages"] == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "缺少参数：messages"}); return }
-		if req.Params["user_id"] == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "缺少参数：user_id"}); return }
+		if req.Params["messages"] == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "需要参数：messages"}); return }
+		if req.Params["user_id"] == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "需要参数：user_id"}); return }
 		body := map[string]interface{}{"messages": req.Params["messages"], "user_id": req.Params["user_id"]}
 		result, err := client.req(ctx, "POST", "/v1/memories/", body)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("调用失败：%v", err)})
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("请求没成功：%v", err)})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": result})
+	case "mem0_get":
+		if req.Params["memory_id"] == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "需要参数：memory_id"}); return }
+		result, err := client.req(ctx, "GET", "/v1/memories/"+fmt.Sprintf("%v", req.Params["memory_id"]), nil)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("请求没成功：%v", err)})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": result})
+	case "mem0_delete":
+		if req.Params["memory_id"] == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "需要参数：memory_id"}); return }
+		result, err := client.req(ctx, "DELETE", "/v1/memories/"+fmt.Sprintf("%v", req.Params["memory_id"]), nil)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("请求没成功：%v", err)})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": result})
 	default:
 		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("不认识工具：%s", req.Tool)})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("不认识的工具：%s", req.Tool)})
 	}
 }
 
@@ -206,7 +339,7 @@ func runStdioServer(client *Client) {
 		var result map[string]interface{}
 		switch method {
 		case "tools/list":
-			result = map[string]interface{}{"tools": []map[string]interface{}{{"name": "mem0_search", "description": "Search memories by query"}, {"name": "mem0_add", "description": "Add a new memory entry"}}}
+			result = map[string]interface{}{"tools": []map[string]interface{}{{"name": "mem0_search", "description": "Search memories by query"}, {"name": "mem0_add", "description": "Add a new memory entry"}, {"name": "mem0_get", "description": "Get a memory by ID"}, {"name": "mem0_delete", "description": "Delete a memory by ID"}}}
 		case "tools/call":
 			params, _ := msg["params"].(map[string]interface{})
 			toolName, _ := params["name"].(string)
@@ -224,23 +357,39 @@ func runStdioServer(client *Client) {
 func handleStdioTool(ctx context.Context, client *Client, toolName string, args map[string]interface{}) map[string]interface{} {
 	switch toolName {
 	case "mem0_search":
-		if args["query"] == nil { return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "缺少参数：query"}}} }
-		result, err := client.req(ctx, "GET", "/v1/memories/?search={query}", nil)
+		if args["query"] == nil { return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "需要参数：query"}}} }
+		result, err := client.req(ctx, "GET", "/v1/memories/?search="+fmt.Sprintf("%v", args["query"]), nil)
 		if err != nil {
-			return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": fmt.Sprintf("调用失败：%v", err)}}}
+			return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": fmt.Sprintf("请求没成功：%v", err)}}}
 		}
 		data, _ := json.Marshal(result)
 		return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": string(data)}}}
 	case "mem0_add":
-		if args["messages"] == nil { return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "缺少参数：messages"}}} }
-		if args["user_id"] == nil { return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "缺少参数：user_id"}}} }
+		if args["messages"] == nil { return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "需要参数：messages"}}} }
+		if args["user_id"] == nil { return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "需要参数：user_id"}}} }
 		result, err := client.req(ctx, "POST", "/v1/memories/", map[string]interface{}{"messages": args["messages"], "user_id": args["user_id"]})
 		if err != nil {
-			return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": fmt.Sprintf("调用失败：%v", err)}}}
+			return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": fmt.Sprintf("请求没成功：%v", err)}}}
+		}
+		data, _ := json.Marshal(result)
+		return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": string(data)}}}
+	case "mem0_get":
+		if args["memory_id"] == nil { return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "需要参数：memory_id"}}} }
+		result, err := client.req(ctx, "GET", "/v1/memories/"+fmt.Sprintf("%v", args["memory_id"]), nil)
+		if err != nil {
+			return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": fmt.Sprintf("请求没成功：%v", err)}}}
+		}
+		data, _ := json.Marshal(result)
+		return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": string(data)}}}
+	case "mem0_delete":
+		if args["memory_id"] == nil { return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "需要参数：memory_id"}}} }
+		result, err := client.req(ctx, "DELETE", "/v1/memories/"+fmt.Sprintf("%v", args["memory_id"]), nil)
+		if err != nil {
+			return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": fmt.Sprintf("请求没成功：%v", err)}}}
 		}
 		data, _ := json.Marshal(result)
 		return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": string(data)}}}
 	default:
-		return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": fmt.Sprintf("不认识工具：%s", toolName)}}}
+		return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": fmt.Sprintf("不认识的工具：%s", toolName)}}}
 	}
 }
